@@ -1,0 +1,9 @@
+/config.toml
+/config.toml.*
+/.env
+/.env.*
+/.venv/
+/dist/
+/.pytest_cache/
+__pycache__/
+*.py[cod]
