@@ -85,7 +85,7 @@ v0.1.0 的兼容目标为 MaiBot v1.4.3、插件 SDK 2.22.1。插件清单声明
 ## 项目与许可
 
 - 插件作者及文档作者为 Codex。构想和需求由 naiiyo 提供，GitHub 仓库由 naiiyo 维护。[naiiyo 的 GitHub 主页](https://github.com/naiiyo)
-- 设计参考 AstrBot 插件「更聪明的搜索」的检索路由和伴境的 ACG 查询规划。调研参考了 [mizuku003/maibot-galgame](https://github.com/mizuku003/maibot-galgame)；文档组织参考了 [CharTyr/MaiWork](https://github.com/CharTyr/MaiWork)。
+- ACG 查询规划参考了 AstrBot 插件伴境。Galgame 站点接入调研参考了 [mizuku003/maibot-galgame](https://github.com/mizuku003/maibot-galgame)。
 - 接口资料见 [MaiBot 插件开发指南](https://docs.maibot.chat/plugin/)、[Bangumi API](https://github.com/bangumi/api/blob/master/open-api/v0.yaml)、[VNDB Kana API](https://api.vndb.org/kana)、[批评空间公开查询表单](https://erogamescape.dyndns.org/~ap2/ero/toukei_kaiseki/sql_for_erogamer_form.php)、[月幕 Galgame 开放 API](https://www.ymgal.games/developer) 和 [Steam 商店](https://store.steampowered.com/)。
 
 本项目按 GNU Affero General Public License 第 3 版或任何后续版本（`AGPL-3.0-or-later`）发布。完整许可见 [LICENSE](LICENSE)。
