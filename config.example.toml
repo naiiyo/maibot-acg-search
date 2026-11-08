@@ -1,0 +1,22 @@
+# MaiBot 从配置模型生成 config.toml。这里列出可用字段和首发默认值。
+[plugin]
+enabled = true
+config_version = "0.1.0"
+
+[search]
+api_protocol = "tavily"
+api_url = ""
+api_key = ""
+web_results = 6
+request_timeout = 10
+planner_routing = true
+
+[catalogue]
+bangumi_token = ""
+egs_proxy = ""
+ymgal_client_id = ""
+ymgal_client_secret = ""
+minimum_galgame_votes = 100
+default_count = 3
+galgame_terms = []
+aliases = []
