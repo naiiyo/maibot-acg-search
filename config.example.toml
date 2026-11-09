@@ -1,7 +1,11 @@
-# MaiBot 从配置模型生成 config.toml。这里列出可用字段和首发默认值。
+# MaiBot 从配置模型生成 config.toml。这里列出可用字段和默认值。
 [plugin]
 enabled = true
-config_version = "0.1.0"
+config_version = "0.1.1"
+
+[intent]
+model_name = ""
+timeout_seconds = 3.0
 
 [search]
 api_protocol = "tavily"
@@ -10,6 +14,7 @@ api_key = ""
 web_results = 6
 request_timeout = 10
 planner_routing = true
+show_source_outages = false
 
 [catalogue]
 bangumi_token = ""

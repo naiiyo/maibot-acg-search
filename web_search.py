@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+from html.parser import HTMLParser
 from urllib.parse import unquote, urlsplit
+
+import httpx
 
 MAX_RESPONSE_BYTES = 512 * 1024
 LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1"}
@@ -42,6 +45,58 @@ def valid_api_url(value: str) -> bool:
     return not url.fragment and not url.query and (
         url.scheme == "https" or url.hostname in LOOPBACK_HOSTS
     )
+
+
+class _PublicPage(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.title = []
+        self.parts = []
+        self.in_title = False
+        self.ignored = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "title":
+            self.in_title = True
+        elif tag in {"script", "style", "template", "svg"}:
+            self.ignored.append(tag)
+        elif tag == "meta" and not self.ignored:
+            meta = dict(attrs)
+            if meta.get("name") == "description" or meta.get("property") == "og:description":
+                self.parts.append(_text(meta.get("content"), 600))
+
+    def handle_endtag(self, tag):
+        if tag == "title":
+            self.in_title = False
+        elif self.ignored and self.ignored[-1] == tag:
+            self.ignored.pop()
+
+    def handle_data(self, data):
+        if not self.ignored and (text := data.strip()):
+            (self.title if self.in_title else self.parts).append(text)
+
+
+async def fetch_public_broadcast(client, url: str, *, timeout: float) -> dict | None:
+    """Read a broadcaster URL already checked by the caller. Never follow a redirect."""
+    try:
+        async with asyncio.timeout(timeout), client.stream(
+            "GET", url, follow_redirects=False,
+            headers={"Accept": "text/html, application/xhtml+xml", "Accept-Encoding": "identity"},
+        ) as response:
+            if response.status_code != 200 or not response.headers.get("Content-Type", "").lower().startswith(
+                ("text/html", "application/xhtml+xml"),
+            ):
+                return None
+            data = bytearray()
+            async for chunk in response.aiter_bytes():
+                data.extend(chunk[:MAX_RESPONSE_BYTES - len(data)])
+                if len(data) >= MAX_RESPONSE_BYTES:
+                    break
+            page = _PublicPage()
+            page.feed(data.decode(response.encoding or "utf-8", errors="replace"))
+            return {"url": url, "title": _text(" ".join(page.title), 180), "content": _text(" ".join(page.parts), 12000)}
+    except (TimeoutError, httpx.HTTPError, ValueError, LookupError):
+        return None
 
 
 def _normalize(payload, max_results: int, *, secret: str = "") -> list[dict]:

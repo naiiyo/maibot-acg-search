@@ -13,10 +13,6 @@ from datetime import date, timedelta
 import httpx
 
 YMGAL = "https://www.ymgal.games"
-# These two values are explicitly designated as the public client credentials.
-# https://www.ymgal.games/developer
-PUBLIC_CLIENT_ID = "ymgal"
-PUBLIC_CLIENT_SECRET = "luna0327"
 MAX_RESPONSE_BYTES = 2_000_000
 
 
@@ -42,8 +38,10 @@ class YmgalClient:
     def __init__(self, client: httpx.AsyncClient, *, client_id="", client_secret="", min_interval=0.5):
         self.client = client
         client_id, client_secret = client_id.strip(), client_secret.strip()
-        self._invalid_credentials = bool(client_id) != bool(client_secret)
-        self._credentials = (client_id, client_secret) if client_id else (PUBLIC_CLIENT_ID, PUBLIC_CLIENT_SECRET)
+        self._credentials = (client_id, client_secret)
+        self.configuration_error = ""
+        if not all(self._credentials):
+            self.configuration_error = "invalid_configuration" if any(self._credentials) else "not_configured"
         self._lock = asyncio.Lock()
         self._token = ""
         self._next_request = 0.0
@@ -90,8 +88,8 @@ class YmgalClient:
         return payload
 
     async def _get(self, path, params, deadline, stats, *, ttl):
-        if self._invalid_credentials:
-            raise YmgalError("invalid_configuration")
+        if self.configuration_error:
+            raise YmgalError(self.configuration_error)
         cache_key = (path, tuple(sorted(params.items())))
         try:
             async with asyncio.timeout(max(0, deadline - time.monotonic())):
