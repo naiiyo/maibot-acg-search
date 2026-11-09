@@ -34,7 +34,7 @@
 
 兼容范围为 MaiBot `1.3.16–1.4.99`、插件 SDK `2.17.0–2.22.99`，安装时需同时满足。下限由插件使用的原生联网搜索与网页读取接口决定，上限覆盖对应次版本的后续补丁更新。插件清单声明 `httpx` 依赖。[MaiBot 插件发布指南](https://docs.maibot.chat/plugin/submission)
 
-1. 在 MaiBot WebUI 的插件市场搜索「二次元特化搜索」并选择 `0.1.1`。也可以在插件管理页上传 GitHub Release 提供的安装 ZIP，或手动将解压后的插件目录放进 MaiBot 的 `plugins/`。手动解压时确认 `_manifest.json` 和 `plugin.py` 位于插件目录第一层。[下载 v0.1.1 安装包](https://github.com/naiiyo/maibot-acg-search/releases/download/v0.1.1/maibot_acg_search-v0.1.1.zip)
+1. 在 MaiBot WebUI 的插件市场搜索「二次元特化搜索」并选择 `0.1.1`。也可以在插件管理页上传 GitHub Release 提供的安装 ZIP，或手动将解压后的插件目录放进 MaiBot 的 `plugins/`。手动解压时确认 `_manifest.json` 和 `plugin.py` 位于插件目录第一层。[下载 v0.1.1 安装包](https://github.com/naiiyo/maibot-acg-search/releases/download/v0.1.1/maibot_acg_search_v0.1.1.zip)
 2. 在插件管理页启用「二次元特化搜索」，并按 WebUI 提示重载或重启。安装后使用「可视化」页调整配置。
 3. 若使用默认网页搜索，在 MaiBot 模型配置的功能分配里给「联网搜索」选择服务。若要补读放送页面，也为「网页读取」分配服务。回到聊天里发送上面的任一命令，检查能否返回带链接的结果。
 
