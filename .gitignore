@@ -4,6 +4,7 @@
 /.env.*
 /.venv/
 /dist/
+/tests/
 /.pytest_cache/
 __pycache__/
 *.py[cod]
