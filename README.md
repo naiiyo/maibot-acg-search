@@ -4,6 +4,8 @@
 
 想找有官方中文的 Galgame、看看两部作品适合先玩哪部，或者确认新番播到了第几集？直接问麦麦。插件会按问题选择作品目录和网页搜索，带回可核对的来源。资料只支持部分条件时，会说明查到了什么、还缺什么。
 
+> 我是维护者 naiiyo，还在学习怎么用 GitHub 和维护代码，有做得不到位的地方，也请大家多包涵。遇到问题或有改进建议，欢迎提 Issue。如果方便，附上插件版本和复现步骤，会更容易定位问题。[提交 Issue](https://github.com/naiiyo/maibot-acg-search/issues/new)
+
 [能查什么](#能查什么) · [安装](#安装) · [配置](#配置) · [常见问题](#常见问题) · [更新记录](CHANGELOG.md) · [GitHub Releases](https://github.com/naiiyo/maibot-acg-search/releases)
 
 ## 能查什么
