@@ -100,7 +100,8 @@ async def _lookup(client, title):
     description = _text(item.get("briefIntroduction"), 430)
     reviews = _impressions(item, names)
     if name and (description or reviews):
-        return {"title": name, "url": f"{_SITE}/entries/index/{entry_id}", "description": description, "reviews": reviews}
+        return {"title": name, "names": [value for value in names if _key(value)],
+                "url": f"{_SITE}/entries/index/{entry_id}", "description": description, "reviews": reviews}
     return None
 
 

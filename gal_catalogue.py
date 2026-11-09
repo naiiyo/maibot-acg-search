@@ -29,7 +29,7 @@ STEAM_REVIEWS = "https://api.steampowered.com/IUserReviewsService/GetAppReviews/
 CATALOGUE_SOURCES = ("bangumi", "vndb", "erogamescape", "ymgal")
 FIRST_RELEASE_SOURCES = ("vndb", "ymgal", "erogamescape", "bangumi")
 VISUAL_NOVEL_TAGS = ("视觉小说", "視覺小說", "文字冒险", "文字冒險", "文字ADV", "Visual Novel", "ノベルゲーム", "ビジュアルノベル")
-USER_AGENT = "naiiyo/maibot-acg-search/0.1.1 (https://github.com/naiiyo/maibot-acg-search)"
+USER_AGENT = "naiiyo/maibot-acg-search/0.1.2 (https://github.com/naiiyo/maibot-acg-search)"
 VN_FIELDS = (
     "title,alttitle,aliases,titles{lang,title,latin},released,rating,votecount,"
     "length_minutes,languages,platforms,tags{name,rating,spoiler,lie},extlinks{url},developers{name,original}"
@@ -90,6 +90,12 @@ def _strings(values) -> tuple[str, ...]:
 
 def _rows(value) -> list[dict]:
     return [row for row in value if isinstance(row, dict)] if isinstance(value, list) else []
+
+
+def _request_error_code(error: BaseException) -> str:
+    if isinstance(error, httpx.HTTPStatusError):
+        return f"HTTP_{error.response.status_code}"
+    return type(error).__name__
 
 
 def _number(value, high: float) -> float | None:
@@ -820,9 +826,33 @@ class _Lookup:
                 raise error
         good = [result for result in results if isinstance(result, list)]
         entries = list({entry.id: entry for rows in good for entry in rows}.values())
-        self.record(site, entries, bool(good), [f"HTTP_{error.response.status_code}" if isinstance(error, httpx.HTTPStatusError)
-                                                else type(error).__name__ for error in errors])
+        self.record(site, entries, bool(good), [_request_error_code(error) for error in errors])
         return entries
+
+    async def collect_sources(self, jobs):
+        """Collect completed sources in order while reserving time for verification."""
+        tasks = {asyncio.create_task(search): site for site, search in jobs}
+        try:
+            done, _ = await asyncio.wait(tasks, timeout=max(0, self.pre_store_deadline - time.monotonic()))
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            outcomes = await asyncio.gather(*tasks, return_exceptions=True)
+
+        results = []
+        for (task, site), outcome in zip(tasks.items(), outcomes, strict=True):
+            if task not in done:
+                self.record(site, [], False, ["TimeoutError"])
+                results.append([])
+            elif isinstance(outcome, Exception):
+                self.record(site, [], False, [_request_error_code(outcome)])
+                results.append([])
+            elif isinstance(outcome, BaseException):
+                raise outcome
+            else:
+                results.append(outcome)
+        return results
 
     def record(self, site, rows, successful, errors):
         status = self.sources[site]
@@ -1362,17 +1392,17 @@ async def gal_recommend(
                         and _key(value) not in unavailable_hints)[:3]
     tag_hints = tuple(value for value in _strings(search_tags) if len(value) <= 45
                       and _key(value) not in {"", "galgame"})[:4]
-    jobs = [bangumi_lookup(names), vndb_lookup(names), egs_lookup(names)]
+    jobs = [("bangumi", bangumi_lookup(names)), ("vndb", vndb_lookup(names)), ("erogamescape", egs_lookup(names))]
     has_ym_seed = bool(names or release_range)
     if has_ym_seed:
-        jobs.append(ymgal_lookup(names))
+        jobs.append(("ymgal", ymgal_lookup(names)))
     if query_hints and (discovery or names):
-        jobs.append(vndb_lookup(query_hints, focused=True, discovery_hint=discovery))
-        jobs.append(bangumi_lookup(query_hints[:2], focused=True, discovery_hint=discovery))
+        jobs.append(("vndb", vndb_lookup(query_hints, focused=True, discovery_hint=discovery)))
+        jobs.append(("bangumi", bangumi_lookup(query_hints[:2], focused=True, discovery_hint=discovery)))
     if discovery and not names and tag_hints:
-        jobs.append(vndb_lookup((), style_seeds=(tag_hints,)))
-        jobs.extend(bangumi_lookup((), tags=("Galgame", tag)) for tag in tag_hints[:2])
-    bangumi, vndb, egs, *extras = await asyncio.gather(*jobs)
+        jobs.append(("vndb", vndb_lookup((), style_seeds=(tag_hints,))))
+        jobs.extend(("bangumi", bangumi_lookup((), tags=("Galgame", tag))) for tag in tag_hints[:2])
+    bangumi, vndb, egs, *extras = await lookup.collect_sources(jobs)
     ym_rows = extras.pop(0) if has_ym_seed else []
     initial = {(row.source, row.id): row for row in [*vndb, *bangumi, *egs, *ym_rows]}
     for rows in extras:
@@ -1437,11 +1467,11 @@ async def gal_recommend(
                 elif _key(title := _candidate_keyword(group)) not in title_keys:
                     canonical.append(title)
             if ids or canonical:
-                supplements.append((missing, query_missing(_strings(canonical), _strings(ids), focused=True)))
+                supplements.append((site, missing, query_missing(_strings(canonical), _strings(ids), focused=True)))
     if supplements:
         known = {(row.source, row.id) for row in entries}
-        additions = await asyncio.gather(*(search for _, search in supplements))
-        for (missing, _), rows in zip(supplements, additions, strict=True):
+        additions = await lookup.collect_sources((site, search) for site, _, search in supplements)
+        for (_, missing, _), rows in zip(supplements, additions, strict=True):
             entries.extend(row for row in rows if (row.source, row.id) not in known
                            and any(_bind(row, member) > 0 for group in missing for member in group))
 
@@ -1455,12 +1485,20 @@ async def gal_recommend(
         groups.sort(key=lambda group: release.released if (release := _release_record(group)) else "",
                     reverse=bool(release_range and release_range[0] <= today.isoformat()))
     unmatched = []
+    ambiguous_candidates = {}
     if names:
         selected = []
         for name in names:
             matches = [group for group in groups if any(_key(name) == _key(alias) for row in group for alias in row.names)]
             if len(matches) != 1:
                 unmatched.append({"title": name, "reason": "ambiguous" if matches else "unverified"})
+                if len(matches) > 1:
+                    candidates = []
+                    for group in matches[:4]:
+                        record = _release_record(group) or group[0]
+                        title = next((row.display for row in group if row.display), record.title)
+                        candidates.append({"title": title, "first_release": record.released, "url": record.url})
+                    ambiguous_candidates[name] = candidates
                 continue
             if matches[0] not in selected:
                 selected.append(matches[0])
@@ -1473,7 +1511,8 @@ async def gal_recommend(
                 state["status"] = "no_match"
     if not groups:
         lookup.sources["steam"]["status"] = "no_candidate"
-        return {**result, "reason": "no_eligible_catalogue_matches", "unmatched_titles": unmatched}
+        return {**result, "reason": "no_eligible_catalogue_matches", "unmatched_titles": unmatched,
+                "ambiguous_candidates": ambiguous_candidates}
     needs_edition = bool((languages and not steam_only) or platforms)
     groups = groups[:min(10, wanted_count + (3 if discovery or needs_edition or steam_only else 0))]
     vn_ids = [row.id for group in groups for row in group if row.source == "vndb"]
@@ -1590,7 +1629,8 @@ async def gal_recommend(
             "release_disagreements": release_disagreements,
             "release_status": "upcoming" if len(released) == 10 and released > today.isoformat() else
             "released" if _known_released(released, today) else "date_unconfirmed",
-            "records": [row.evidence() for row in group], "tags": visible_genres,
+            "records": [{**row.evidence(), **({"tags": list(row.tags[:12])} if "tags" in fields else {})}
+                        for row in group], "tags": visible_genres,
             "style_evidence": style_evidence, "style_unverified": style_unverified,
             "length_minutes": vndb_row.minutes or None if vndb_row else None,
             "edition": edition, "steam": store, "missing_sources": missing_sites, "missing_fields": missing_fields,
@@ -1604,7 +1644,8 @@ async def gal_recommend(
             reason = "official_localized_edition_not_verified" if official_translation else "matching_edition_not_verified"
         else:
             reason = "no_eligible_catalogue_matches"
-        return {**result, "reason": reason, "unmatched_titles": unmatched}
+        return {**result, "reason": reason, "unmatched_titles": unmatched,
+                "ambiguous_candidates": ambiguous_candidates}
     if discovery and not names:
         eligible_items.sort(key=lambda item: (_style_order(item["style_unverified"]), bool(item["missing_fields"])))
     result["items"] = eligible_items[:wanted_count]
@@ -1613,5 +1654,5 @@ async def gal_recommend(
     )
     reason = "" if full else "requested_evidence_incomplete"
     return {**result, "status": "ok" if full else "partial", "reason": reason,
-            "unmatched_titles": unmatched, "ranking": ranking or "balanced",
+            "unmatched_titles": unmatched, "ambiguous_candidates": ambiguous_candidates, "ranking": ranking or "balanced",
             "score_filter_source": score_source, "scope": "bounded_catalogue_sample_current_cumulative_stats"}

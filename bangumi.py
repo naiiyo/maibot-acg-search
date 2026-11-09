@@ -30,7 +30,7 @@ _SUBJECT_LINK = re.compile(r'https?://(?:www\.)?(?:bgm\.tv|bangumi\.tv|chii\.in)
 _RELATED = {'staff': ('persons', 'people'), 'characters': ('characters', 'characters'), 'relations': ('subjects', 'relations')}
 _COLLECTION_TYPES = ('wish', 'collect', 'doing', 'on_hold', 'dropped')
 _MAX_RESPONSE = 2_000_000
-_USER_AGENT = 'naiiyo/maibot-acg-search/0.1.1 (https://github.com/naiiyo/maibot-acg-search)'
+_USER_AGENT = 'naiiyo/maibot-acg-search/0.1.2 (https://github.com/naiiyo/maibot-acg-search)'
 _EPISODE_MARKER = re.compile(
     r'更新至第?\s*\d+\s*[集话話]|第\s*\d+\s*[集话話]|\b(?:episode|ep\.?)[ #]*\d+\b'
     r'|(?<!\w)[#＃]\s*\d{1,4}\b|(?<![\w全共])\d{1,4}\s*[集话話]', re.I,
@@ -629,7 +629,7 @@ async def recommend_bangumi(client, query, *, domain, task, entities=(), year=No
                             date_from='', date_to='',
                             preferences=(), exclusions=(), excluded_titles=(), count=3, token='', search_web=None, fetch_web=None,
                             fetch_direct=None, fields=(), search_terms=(), search_tags=(), broadcast_query='',
-                            region='', sort='rank', today=None, user_agent=_USER_AGENT):
+                            region='', sort='rank', today=None, user_agent=_USER_AGENT, deadline=None):
     """Return bounded catalogue matches and independent, attributed web evidence."""
     output = {'source': 'Bangumi', 'status': 'empty', 'results': [], 'warnings': [],
               'official_broadcast': {'status': 'not_requested', 'references': []}}
@@ -748,11 +748,24 @@ async def recommend_bangumi(client, query, *, domain, task, entities=(), year=No
             if field in fields:
                 for row in records[:2]:
                     jobs[(row['id'], key)] = _related_records(client, headers, row['id'], kind, diagnostics)
+    enrichment_timed_out = False
     if jobs:
         by_id = {row['id']: row for row in records}
-        answers = await asyncio.gather(*jobs.values(), return_exceptions=True)
-        for (identifier, key), result in zip(jobs, answers):
-            if isinstance(result, asyncio.CancelledError):
+        tasks = {key: asyncio.create_task(search) for key, search in jobs.items()}
+        remaining = None if deadline is None else max(0, deadline - asyncio.get_running_loop().time())
+        try:
+            done, _ = await asyncio.wait(tasks.values(), timeout=remaining)
+        finally:
+            for search in tasks.values():
+                if not search.done():
+                    search.cancel()
+            answers = await asyncio.gather(*tasks.values(), return_exceptions=True)
+        for ((identifier, key), search), result in zip(tasks.items(), answers, strict=True):
+            if search not in done:
+                enrichment_timed_out = True
+                diagnostics.add(('episodes' if key == 'episode_evidence' else key, 'timeout'))
+                result = None
+            elif isinstance(result, asyncio.CancelledError):
                 raise result
             if identifier is None:
                 output[key] = result if isinstance(result, dict) else {'status': 'error', 'references': []}
@@ -762,6 +775,6 @@ async def recommend_bangumi(client, query, *, domain, task, entities=(), year=No
                 by_id[identifier][key] = result
     if diagnostics:
         output['request_diagnostics'] = [{'endpoint': route, 'status': status} for route, status in sorted(diagnostics)]
-    output['status'] = ('partial' if records and (errors or unmatched or ambiguous) else 'ok' if records
+    output['status'] = ('partial' if records and (errors or unmatched or ambiguous or enrichment_timed_out) else 'ok' if records
                         else 'error' if errors and errors == len(keywords) else 'empty')
     return output

@@ -5,10 +5,18 @@ from __future__ import annotations
 import asyncio
 import re
 from datetime import datetime, timezone
+from functools import partial
 from urllib.parse import urlsplit
 
 from .bangumi import _broadcaster, recommend_bangumi
 from .cngal import fetch_cngal_details
+from .comparison import (
+    build_comparison,
+    comparison_fields,
+    comparison_queries,
+    comparison_sources,
+    matches_comparison_source,
+)
 from .gal_catalogue import gal_recommend
 from .web_search import fetch_public_broadcast, search_web
 
@@ -66,6 +74,11 @@ def _gal_task(intent) -> str:
     return "details"
 
 
+def is_named_comparison(intent) -> bool:
+    return (intent.route == "catalogue" and len(intent.titles) > 1
+            and (intent.task == "comparison" or intent.task == "fact" and bool(intent.fields)))
+
+
 async def run_search(ctx, client, config, intent, *, egs_client=None, ymgal=None, loopback_client=None, today=None) -> dict:
     """One bounded search round. Every web step uses the same backend snapshot."""
     report = {
@@ -94,6 +107,10 @@ async def run_search(ctx, client, config, intent, *, egs_client=None, ymgal=None
             "fields": list(intent.fields), "titles": list(intent.titles),
             "style_preferences": list(intent.styles),
         }
+
+    comparing = is_named_comparison(intent)
+    fields = comparison_fields(intent) if comparing else intent.fields
+    comparison_targets = {}
 
     if intent.titles and {"summary", "reviews"}.intersection(intent.fields):
         report["guidance"] += (
@@ -135,29 +152,63 @@ async def run_search(ctx, client, config, intent, *, egs_client=None, ymgal=None
         return await fetch_public_broadcast(client, url, timeout=remaining)
 
     def add_web(query, result):
-        report["web"].append({"query": query, **result})
+        entry = {**result, "query": query}
+        if query in comparison_targets:
+            title, wanted_fields, source = comparison_targets[query]
+            entry.update(comparison_title=title, comparison_fields=list(wanted_fields), comparison_source=source)
+            if source:
+                entry["results"] = [hit for hit in entry["results"] if matches_comparison_source(hit["url"], source)]
+                if entry["status"] == "ok" and not entry["results"]:
+                    entry["status"] = "empty"
+        report["web"].append(entry)
+
+    def has_evidence(directory):
+        return bool(directory.get("items") or directory.get("results") or directory.get("news")
+                    or (directory.get("official_broadcast") or {}).get("references")
+                    or (directory.get("official_broadcast") or {}).get("official_page_evidence"))
+
+    def has_report_evidence():
+        return (has_evidence(report.get("catalogue", {})) or bool(report.get("cngal"))
+                or any(has_evidence(row) for row in report.get("related_catalogues", {}).values())
+                or any(row["results"] for row in report["web"]))
+
+    async def collect(operation, save, warning):
+        try:
+            result = await operation()
+        except Exception as error:
+            ctx.logger.warning("%s（%s）", warning, type(error).__name__)
+        else:
+            save(result)
+
+    web_order = {}
+
+    async def collect_web(jobs):
+        async with asyncio.TaskGroup() as group:
+            for query, operation in jobs.items():
+                web_order.setdefault(query, len(web_order))
+                group.create_task(collect(operation, partial(add_web, query), "网页检索未完成"))
 
     async def bangumi(medium, count):
         return await recommend_bangumi(
             client, intent.query, domain=medium, task=intent.task,
-            entities=intent.titles, year=intent.year, month=intent.month, fields=intent.fields,
+            entities=intent.titles, year=intent.year, month=intent.month, fields=fields,
             date_from=intent.date_from, date_to=intent.date_to,
             search_terms=intent.search_terms, search_tags=intent.search_tags, broadcast_query=intent.broadcast_query,
             preferences=intent.genres, exclusions=intent.exclusions, excluded_titles=intent.excluded_titles, count=count,
             token=catalogue.bangumi_token.strip(), search_web=ask, fetch_web=fetch, fetch_direct=fetch_direct, region=intent.region,
             sort={"popularity": "heat", "rating": "score"}.get(intent.ranking, "rank"),
-            today=today,
+            today=today, deadline=deadline,
         )
 
     try:
         async with asyncio.timeout(TOTAL_SECONDS):
             if intent.route == "catalogue":
                 count = intent.count or catalogue.default_count
-                named_detail = bool(intent.titles and {"summary", "reviews"}.intersection(intent.fields))
+                named_detail = bool(intent.titles and {"summary", "reviews"}.intersection(fields))
                 detail_site = _detail_site(intent) if named_detail else ""
-                try:
+                async def primary():
                     if intent.medium == "galgame":
-                        primary = gal_recommend(
+                        return await gal_recommend(
                             client, intent.query, entities=intent.titles, year=intent.year,
                             years=intent.years, date_from=intent.date_from, date_to=intent.date_to,
                             language=intent.language, platform=intent.platform, preferences=intent.genres,
@@ -172,47 +223,74 @@ async def run_search(ctx, client, config, intent, *, egs_client=None, ymgal=None
                             historical_popularity=intent.ranking == "popularity" and bool(
                                 _HISTORICAL_HEAT.search(intent.query)
                             ),
-                            ymgal=ymgal, task=_gal_task(intent), fields=intent.fields,
+                            ymgal=ymgal, task="comparison" if comparing else _gal_task(intent), fields=fields,
                             similar_to=intent.similar_to, styles=intent.styles,
                             excluded_titles=intent.excluded_titles, date_basis=intent.date_basis,
                             search_terms=intent.search_terms, search_tags=intent.search_tags or intent.styles,
                             min_votes_required=catalogue.minimum_galgame_votes != 100,
                         )
-                        if named_detail and detail_site in {"", "cngal.org"}:
-                            directory, details = await asyncio.gather(
-                                primary, fetch_cngal_details(client, intent.titles, timeout=6),
-                                return_exceptions=True,
-                            )
-                            if isinstance(details, asyncio.CancelledError):
-                                raise details
-                            if isinstance(details, Exception):
-                                ctx.logger.warning("CnGal 详情查询未完成（%s）", type(details).__name__)
-                            elif details:
-                                report["cngal"] = details
-                            if isinstance(directory, BaseException):
-                                raise directory
-                            report["catalogue"] = directory
-                        else:
-                            report["catalogue"] = await primary
-                    else:
-                        report["catalogue"] = await bangumi(intent.medium, count)
-                except Exception as error:
-                    ctx.logger.warning("二次元特化搜索目录查询未完成（%s）", type(error).__name__)
-                    report["catalogue"] = {"status": "error", "reason": "目录查询未完成。"}
+                    return await bangumi(intent.medium, count)
 
+                def add_cngal(details):
+                    if details:
+                        report.setdefault("cngal", []).extend(details)
+
+                cngal_title_groups = []
+                if intent.medium == "galgame" and named_detail:
+                    if comparing:
+                        for title in intent.titles[:4]:
+                            scopes = [
+                                comparison_sources(intent, field, title)
+                                for field in comparison_fields(intent, title) if field in {"summary", "reviews"}
+                            ]
+                            if any(not sources or "cngal" in sources for sources in scopes):
+                                cngal_title_groups.append((title,))
+                    elif detail_site in {"", "cngal.org"}:
+                        cngal_title_groups.append(intent.titles)
+                async with asyncio.TaskGroup() as group:
+                    group.create_task(collect(primary, partial(report.__setitem__, "catalogue"), "目录查询未完成"))
+                    for titles in cngal_title_groups:
+                        group.create_task(collect(partial(fetch_cngal_details, client, titles, timeout=6),
+                                                  add_cngal, "CnGal 详情查询未完成"))
+                    for medium in intent.related_media:
+                        related = report.setdefault("related_catalogues", {})
+                        group.create_task(collect(partial(bangumi, medium, count), partial(related.__setitem__, medium),
+                                                  "关联目录补查未完成"))
+
+                report.setdefault("catalogue", {"status": "error", "reason": "目录查询未完成。"})
                 directory = report["catalogue"]
                 items = directory.get("items") or directory.get("results") or directory.get("news") or []
                 official = directory.get("official_broadcast") or {}
                 commerce = bool(re.search(r"价格|预算|[0-9]\s*(?:元|块)", intent.query))
                 supplemental_constraints = commerce or bool(intent.region and intent.medium == "galgame")
-                supplemental_constraints |= intent.medium != "galgame" and bool(
-                    intent.language or intent.platform or intent.min_score is not None or intent.max_score is not None
-                )
+                score_threshold = intent.min_score is not None or intent.max_score is not None
+                supplemental_constraints |= comparing and score_threshold
+                supplemental_constraints |= intent.medium != "galgame" and bool(intent.language or intent.platform or score_threshold)
                 if supplemental_constraints:
                     report["guidance"] += (
                         " 价格、地区、语言、平台和分数门槛只按明确的对应证据核对；"
                         "补查仍未核实的条件需要说明。"
                     )
+                if comparing:
+                    comparison = build_comparison(intent, report)
+                    report["comparison"] = comparison
+                    report["guidance"] += (
+                        " 按作品分别回答，只把明确对应作品、字段和来源的资料写成已核实事实。"
+                        "候选和网页补查线索需要继续核对，同名候选无法区分时请用户确认。"
+                    )
+                    jobs = {}
+                    for query, title, wanted_fields, source in comparison_queries(comparison):
+                        comparison_targets[query] = (title, wanted_fields, source)
+                        jobs[query] = partial(ask, query)
+                    if supplemental_constraints:
+                        for query in _web_queries(intent):
+                            jobs.setdefault(query, partial(ask, query))
+                    await collect_web(jobs)
+                    report["status"] = (
+                        "ok" if comparison.get("complete") and not supplemental_constraints else
+                        "partial" if has_report_evidence() else "insufficient_evidence"
+                    )
+                    return report
                 no_evidence = not items and not official.get("references") and not report.get("cngal")
                 needs_official = intent.medium in {"manga", "acg_game"} and intent.task in {
                     "progress", "schedule", "release", "availability", "news",
@@ -240,7 +318,7 @@ async def run_search(ctx, client, config, intent, *, egs_client=None, ymgal=None
                 jobs = {}
                 if no_evidence or supplemental_constraints or needs_official or needs_web_detail or needs_style_sources:
                     for query in _web_queries(intent, site=detail_site):
-                        jobs[query] = ask(query)
+                        jobs[query] = partial(ask, query)
                 if (intent.medium == "galgame" and len(intent.titles) == len(items) == 1
                         and not detail_site and not intent.web_queries and "reviews" in intent.fields
                         and not (items[0].get("steam") or {}).get("review_samples")
@@ -250,41 +328,32 @@ async def run_search(ctx, client, config, intent, *, egs_client=None, ymgal=None
                     if original and original != intent.titles[0]:
                         query = re.sub(re.escape(intent.titles[0]), lambda _: original, _search_query(intent), flags=re.I)
                         if query not in jobs:
-                            jobs[query] = ask(query)
-                for medium in intent.related_media:
-                    jobs[medium] = bangumi(medium, count)
-                if jobs:
-                    for key, result in zip(jobs, await asyncio.gather(*jobs.values(), return_exceptions=True), strict=True):
-                        if isinstance(result, asyncio.CancelledError):
-                            raise result
-                        if isinstance(result, Exception):
-                            ctx.logger.warning("补查未完成（%s）", type(result).__name__)
-                            continue
-                        if key in intent.related_media:
-                            report.setdefault("related_catalogues", {})[key] = result
-                        else:
-                            add_web(key, result)
+                            jobs[query] = partial(ask, query)
+                await collect_web(jobs)
                 status_check_needed = intent.medium == "anime" and intent.task in {"schedule", "progress", "availability"}
                 report["status"] = (
                     "ok" if items and directory.get("status") == "ok"
                     and not supplemental_constraints and not status_check_needed and not needs_official
-                    else "partial" if items or official.get("references") or report.get("related_catalogues") or report.get("cngal")
-                    or any(row["results"] for row in report["web"])
+                    else "partial" if has_report_evidence()
                     else "insufficient_evidence"
                 )
                 return report
 
             queries = _web_queries(intent, site=_detail_site(intent) if intent.titles else "")
-            for query, result in zip(queries, await asyncio.gather(*(ask(query) for query in queries)), strict=True):
-                add_web(query, result)
+            await collect_web({query: partial(ask, query) for query in queries})
             report["status"] = (
                 "ok" if any(row["results"] for row in report["web"])
-                else report["web"][0]["status"]
+                else min(report["web"], key=lambda row: web_order[row["query"]])["status"] if report["web"]
+                else "error"
             )
             return report
     except TimeoutError:
-        return {**report, "status": "partial" if report.get("catalogue") else "error",
+        if comparing and "comparison" not in report:
+            report["comparison"] = build_comparison(intent, report)
+        return {**report, "status": "partial" if has_report_evidence() else "error",
                 "reason": "本轮搜索达到时间上限，只能使用已经取得的资料。"}
+    finally:
+        report["web"].sort(key=lambda row: web_order[row["query"]])
 
 
 def planner_tools(definitions, *, prefer_plugin=False, galgame_catalogue=False) -> list[dict] | None:

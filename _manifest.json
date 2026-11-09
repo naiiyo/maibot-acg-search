@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "id": "naiiyo.acg-search",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "name": "二次元特化搜索",
   "description": "分来源查询 Galgame 作品、热度和发行版本，查找番剧放送、漫画与二游资料，并按需调用原生或自定义网页搜索。",
   "author": {"name": "naiiyo", "url": "https://github.com/naiiyo"},
