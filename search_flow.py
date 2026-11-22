@@ -19,6 +19,7 @@ from .comparison import (
 )
 from .gal_catalogue import gal_recommend
 from .web_search import fetch_public_broadcast, search_web
+from .work_links import extract_work_links, lookup_work_links
 
 TOTAL_SECONDS = 28
 TOOL_NAME = "acg_search"
@@ -98,6 +99,8 @@ async def run_search(ctx, client, config, intent, *, egs_client=None, ymgal=None
     if intent.route == "clarify":
         prompt = ("你想查哪部番剧？请告诉我作品名，必要时加上季度或续作名称。"
                   if intent.reason == "missing_anime_title" else "你想找 Galgame、番剧、漫画，还是二次元游戏？")
+        if intent.reason == "missing_series_title":
+            prompt = "你想了解哪个系列的顺序？可以发作品名或 Bangumi 条目链接。"
         return {**report, "status": "clarify", "reason": prompt}
 
     if intent.route == "catalogue":
@@ -188,10 +191,15 @@ async def run_search(ctx, client, config, intent, *, egs_client=None, ymgal=None
                 web_order.setdefault(query, len(web_order))
                 group.create_task(collect(operation, partial(add_web, query), "网页检索未完成"))
 
-    async def bangumi(medium, count):
+    async def bangumi(medium, count, *, exact_url=""):
+        question = intent.query
+        if exact_url:
+            for url in intent.titles:
+                question = question.replace(url, " ")
+            question = exact_url + " " + question.strip()
         return await recommend_bangumi(
-            client, intent.query, domain=medium, task=intent.task,
-            entities=intent.titles, year=intent.year, month=intent.month, fields=fields,
+            client, question, domain=medium, task=intent.task,
+            entities=(exact_url,) if exact_url else intent.titles, year=intent.year, month=intent.month, fields=fields,
             date_from=intent.date_from, date_to=intent.date_to,
             search_terms=intent.search_terms, search_tags=intent.search_tags, broadcast_query=intent.broadcast_query,
             preferences=intent.genres, exclusions=intent.exclusions, excluded_titles=intent.excluded_titles, count=count,
@@ -204,6 +212,19 @@ async def run_search(ctx, client, config, intent, *, egs_client=None, ymgal=None
         async with asyncio.timeout(TOTAL_SECONDS):
             if intent.route == "catalogue":
                 count = intent.count or catalogue.default_count
+                if intent.reason == "work_link":
+                    links = tuple(link for url in intent.titles for link in extract_work_links(url))
+                    directory = await lookup_work_links(
+                        client, links, ymgal=ymgal, region=intent.region, fields=intent.fields,
+                        language=intent.language, platform=intent.platform,
+                        official_translation=intent.official_translation, today=today,
+                        intent=intent, timeout=min(16, max(0.1, deadline - loop.time() - 0.25)),
+                        bangumi_lookup=lambda url: bangumi("bangumi", 1, exact_url=url),
+                    )
+                    report["catalogue"] = directory
+                    report["status"] = directory["status"]
+                    report["guidance"] += " 逐条回答链接所指对象，分别说明商店版本、试玩版和原作。只确认有直接依据的字段。"
+                    return report
                 named_detail = bool(intent.titles and {"summary", "reviews"}.intersection(fields))
                 detail_site = _detail_site(intent) if named_detail else ""
                 async def primary():
@@ -330,7 +351,20 @@ async def run_search(ctx, client, config, intent, *, egs_client=None, ymgal=None
                         if query not in jobs:
                             jobs[query] = partial(ask, query)
                 await collect_web(jobs)
-                status_check_needed = intent.medium == "anime" and intent.task in {"schedule", "progress", "availability"}
+                anime_lookup = intent.medium == "anime" or intent.medium == "bangumi" and any(
+                    row.get("subject_domain") == "anime" for row in items)
+                status_check_needed = anime_lookup and intent.task in {"schedule", "progress", "availability"}
+                if status_check_needed and len(items) == 1:
+                    pages = official.get("official_page_evidence") or []
+                    state = {"availability": "available", "schedule": "scheduled"}.get(intent.task)
+                    precise = (any(page.get("explicit_latest") for page in pages) if intent.task == "progress" else
+                               any(page.get("episode_status") == state for page in pages))
+                    status_check_needed = not precise
+                if "series_order" in fields:
+                    guides = [row.get("series_guide") or {} for row in items]
+                    status_check_needed |= any(not guide.get("main_order") or guide.get("coverage") == "partial"
+                                               or guide.get("chapter_mapping", {}).get("status") == "unconfirmed"
+                                               for guide in guides)
                 report["status"] = (
                     "ok" if items and directory.get("status") == "ok"
                     and not supplemental_constraints and not status_check_needed and not needs_official

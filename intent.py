@@ -9,6 +9,10 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, timedelta
 
+from .series import series_request, series_title
+from .broadcast import strip_broadcast_scope
+from .work_links import extract_work_links, public_link_question
+
 
 @dataclass(frozen=True)
 class SearchIntent:
@@ -90,8 +94,7 @@ _DETAIL_BOUNDARY = "|".join((
 _FACT = r"是谁|哪里|哪[年天家个些款部]|多少|几[个部天集分]|有(?:没有|无)|有吗|了吗|怎样|怎么样|如何|查询|资料|事实|评[价测分]|口碑|好玩吗|好看吗|能玩吗|能看吗|表现|值得|发售|上架|更新|新闻|信息|版本|发布时间|最新|查证|核实|实测|攻略|定价|价格|销量|详情|背景|出了|开服|新作|\?$|" + "|".join((_SUMMARY, _REVIEWS, _CHARACTERS, _RELATIONS))
 _QUARTER = r"(?<![A-Za-z])Q\s*([1-4])(?![A-Za-z0-9])|(?<!\d)(?:第\s*)?([1-4一二三四])\s*季度"
 _BANGUMI_SUBJECT = re.compile(
-    r"(?<![A-Za-z0-9./])https?://(?:www\.)?(?:bgm\.tv|bangumi\.tv|chii\.in)/subject/([1-9]\d{0,9})(?=$|[/?#\s>\],;!?)\u3000-\u9fff])"
-    r"|(?<![A-Za-z0-9])(?:Bangumi|bgm(?:\.tv)?|番组计划)\s*(?:条目\s*)?ID\s*[:=#]?\s*([1-9]\d{0,9})(?![A-Za-z0-9])",
+    r"(?<![A-Za-z0-9])(?:Bangumi|bgm(?:\.tv)?|番组计划)\s*(?:条目\s*)?ID\s*[:=#]?\s*([1-9]\d{0,9})(?![A-Za-z0-9])",
     re.IGNORECASE,
 )
 _EXTERNAL = r"新闻|天气|股价|汇率|比分|赛程|政策|时刻表|营业时间|票价|在售|库存|价格|官方公告|最近(?:发布|上线)|当前版本|今天(?:下雨|有雨)|明天(?:下雨|有雨)|几度|怎么走|\b(?:weather|stock price|exchange rate|release date)\b"
@@ -270,7 +273,7 @@ def _detect_titles(text: str, task: str, medium: str, known) -> tuple[str, ...]:
                 return _unique((left, right))
     if medium == "anime" and task in {"progress", "schedule", "availability"}:
         candidate = re.split(r"(?:更新|更到|播到|放送到|放送|第[一二三四五六七八九十几\d]+[集话]|哪一集|什么时候|何时|播出|开播|首播|完结)", text, maxsplit=1)[0]
-        candidate = _candidate_title(candidate)
+        candidate = strip_broadcast_scope(_candidate_title(candidate))
         if candidate and not _search(r"\d{1,2}\s*月(?:新)?番|[春夏秋冬](?:季)?番|新番表|排期|本季|本月|下季|本周|下周|最新番剧", candidate):
             if not known or _search(r"第[一二三四五六七八九十\d]+季|续篇|续作", candidate):
                 return (candidate,)
@@ -323,7 +326,7 @@ def _detect_dates(text: str, today: date) -> tuple[tuple[int, ...], int | None, 
     def dates(first: date, last: date) -> tuple[tuple[int, ...], int | None, str, str]:
         return years, month, first.isoformat(), last.isoformat()
 
-    absolute = _search(r"(?<!\d)((?:19|20)\d{2})[-/年]\s*(\d{1,2})[-/月]\s*(\d{1,2})(?:日|号|\b)", text)
+    absolute = _search(r"(?<!\d)((?:19|20)\d{2})[-/年]\s*(\d{1,2})[-/月]\s*(\d{1,2})(?:日|号|(?![0-9A-Za-z]))", text)
     if absolute:
         try:
             exact = date(*map(int, absolute.groups()))
@@ -374,12 +377,12 @@ def _detect_score(text: str) -> tuple[str, float | None, float | None, str]:
     ) if _search(pattern, text)]
     source = sources[0] if len(sources) == 1 else ""
     number = r"(?<![\d.])([0-9]{1,3}(?:\.\d+)?)(?![\d.])"
-    between = _search(rf"{number}\s*分?\s*(?:到|至|[-~—])\s*{number}\s*分", text)
+    between = _search(rf"{number}\s*分?\s*(?:到|至|[-~—])\s*{number}\s*分(?!钟|鐘)", text)
     if between:
         low, high = sorted(map(float, between.groups()))
         return "rating", low if low <= 100 else None, high if high <= 100 else None, source
-    minimum = _search(rf"(?:至少|不低于|高于|大于|≥|>=)\s*{number}\s*分|{number}\s*分\s*(?:以上|起|起步|\+)", text)
-    maximum = _search(rf"(?:至多|不高于|低于|小于|≤|<=)\s*{number}\s*分|{number}\s*分\s*(?:以下|以内)", text)
+    minimum = _search(rf"(?:至少|不低于|(?<!不)(?:高于|大于)|≥|>=)\s*{number}\s*分(?!钟|鐘)|{number}\s*分\s*(?:以上|起|起步|\+)", text)
+    maximum = _search(rf"(?:至多|不高于|(?<!不)(?:低于|小于)|≤|<=)\s*{number}\s*分(?!钟|鐘)|{number}\s*分\s*(?:以下|以内)", text)
     if (source or ranking == "rating") and not minimum:
         minimum = _search(rf"{number}\s*\+(?!\d)", text)
     low = float(next(value for value in minimum.groups() if value is not None)) if minimum else None
@@ -529,6 +532,8 @@ def classify(
         return SearchIntent(query, task="chat", reason="no_web")
     if _search(_CREATIVE, text):
         return SearchIntent(query, task="creative", reason="transform_or_creative")
+    if extract_work_links(text):
+        query = text = public_link_question(text)
     lookup_request = _search(_EXPLICIT, text)
     explicit = force_search or bool(lookup_request)
     if not explicit and _search(_ABOUT_BOT, text):
@@ -549,11 +554,28 @@ def classify(
             and _search(rf"(?:{_RANKING_QUALIFIER}|人气)\s*(?:的\s*)?(?:{_ANIME}|{_MANGA}|{_GALGAME_KIND}|{_ACG_GAME})[?!。]*$", request)):
         task = "recommendation"
     titles = _detect_titles(request, task, medium, known)
-    if task != "recommendation" and (subjects := _unique(
-        f"https://bgm.tv/subject/{match[1] or match[2]}" for match in _BANGUMI_SUBJECT.finditer(request)
-    )):
-        medium, titles = "bangumi", subjects[:4]
-    if medium == "manga" and _search(_MANGA_PROGRESS, text) and task != "recommendation":
+    series = series_request(request) and not _search(r"电视剧|真人电影|美剧|教程|教材|文档", request)
+    if series and len(titles) > 1 and (task == "comparison" or not _search(r"系列|正传|外传|补番顺序", request)):
+        series, task = False, "comparison"
+        if medium == "other" and _search(r"先看哪", request):
+            medium = "anime"
+    if series and medium not in {"galgame", "game", "acg_game"}:
+        task = "fact"
+        medium = "manga" if medium == "manga" and not _search(_ANIME, request) else "anime"
+        if not known and not _QUOTED.search(request):
+            titles = tuple(filter(None, (series_title(request),)))
+    else:
+        series = False
+    links = extract_work_links(request)
+    direct = bool(links and any(link.source != "bangumi" for link in links))
+    if links:
+        titles = tuple(link.url for link in links)
+        medium = ("game" if all(link.source == "steam" for link in links) else "galgame") if direct else "bangumi"
+        if task == "recommendation":
+            task = "fact"
+    elif task != "recommendation" and (ids := _BANGUMI_SUBJECT.findall(request)):
+        medium, titles = "bangumi", _unique(f"https://bgm.tv/subject/{v}" for v in ids)[:4]
+    if medium == "manga" and _search(_MANGA_PROGRESS, text) and task != "recommendation" and not series:
         task = "progress"
     if medium == "acg_game" and _search(_GAME_UPDATE, text) and task in {"fact", "schedule", "progress"}:
         task = "progress"
@@ -566,6 +588,9 @@ def classify(
         similar_to, *remaining = titles
         titles = tuple(remaining)
     positive = _constraints_text(request, known)
+    if links:
+        for link in links:
+            positive = positive.replace(link.url, " ")
     years, month, start, end = _detect_dates(positive, today or date.today())
     platforms = tuple(name for name, pattern in (
         ("Steam", r"(?<![A-Za-z0-9])steam(?![A-Za-z0-9])"),
@@ -579,13 +604,13 @@ def classify(
         ("简体中文", r"简中|简体中文"), ("繁体中文", r"繁中|繁体中文"), ("中文", r"中文|汉化|官中"),
         ("日文", r"日文|日语|生肉"), ("英文", r"英文|英语"),
     ) if _search(pattern, positive)), "")
-    official_translation = medium == "galgame" and bool(_search(
+    official_translation = (medium == "galgame" or direct) and bool(_search(
         r"官中|官方(?:简体中文|繁体中文|中文|简中|繁中|汉化)", positive,
     ))
     region = _search(r"中国大陆|中国香港|中国台湾|中国|大陆|国区|国服|日区|日服|日本|美区|美服|美国|港区|港服|香港|台区|台服|台湾|国际服|海外|北美|欧洲|全球", positive)
     spoiler = "avoid" if _search(_SPOILER_NO, text) else "allow" if _search(_SPOILER_YES, text) else "unspecified"
     ranking, minimum, maximum, score_source = _detect_score(positive)
-    min_hours, max_hours = _detect_playtime(positive) if medium == "galgame" and task in {"recommendation", "comparison"} else (None, None)
+    min_hours, max_hours = _detect_playtime(positive) if direct or medium == "galgame" and task in {"recommendation", "comparison"} else (None, None)
     genres, styles = _preferences(positive, medium)
     exclusions, excluded_titles = _exclusions(exclusions_raw, medium, aliases)
     date_basis = "steam" if medium == "galgame" and _search(_STEAM_DATE, positive) else "first_release"
@@ -599,11 +624,17 @@ def classify(
         ("characters", _CHARACTERS), ("relations", _RELATIONS),
         ("tags", r"题材|类型|标签"),
     ) if _search(pattern, positive))
+    if series:
+        fields = (*fields, "series_order")
     bare_title = any(not (text[:start_at] + text[stop:]).strip(" 《》「」『』“”!?")
                      for start_at, stop, _, _ in known)
     bare_title = bare_title or bool(_QUOTED.fullmatch(text.strip("!?")))
     if not explicit and _search(_CASUAL, text) and not _search(r"[?]|请问|推荐|怎么|为什么|攻略", text):
         route, reason, task = "skip", "casual", "chat"
+    elif direct:
+        route, reason = "catalogue", "work_link"
+    elif series:
+        route, reason = ("catalogue", "series_order") if titles else ("clarify", "missing_series_title")
     elif medium == "anime" and task == "progress" and not titles:
         route, reason = "clarify", "missing_anime_title"
     elif medium == "bangumi":

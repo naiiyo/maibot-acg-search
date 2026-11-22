@@ -9,6 +9,7 @@ import math
 import re
 import time
 import unicodedata
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from html import unescape
@@ -29,7 +30,7 @@ STEAM_REVIEWS = "https://api.steampowered.com/IUserReviewsService/GetAppReviews/
 CATALOGUE_SOURCES = ("bangumi", "vndb", "erogamescape", "ymgal")
 FIRST_RELEASE_SOURCES = ("vndb", "ymgal", "erogamescape", "bangumi")
 VISUAL_NOVEL_TAGS = ("视觉小说", "視覺小說", "文字冒险", "文字冒險", "文字ADV", "Visual Novel", "ノベルゲーム", "ビジュアルノベル")
-USER_AGENT = "naiiyo/maibot-acg-search/0.1.2 (https://github.com/naiiyo/maibot-acg-search)"
+USER_AGENT = "naiiyo/maibot-acg-search/0.1.3 (https://github.com/naiiyo/maibot-acg-search)"
 VN_FIELDS = (
     "title,alttitle,aliases,titles{lang,title,latin},released,rating,votecount,"
     "length_minutes,languages,platforms,tags{name,rating,spoiler,lie},extlinks{url},developers{name,original}"
@@ -897,7 +898,8 @@ class _Lookup:
             return []
 
     async def steam(self, names, ids, country, years, developers, *, languages=(), require_price=False, reviews=False,
-                    review_text=False, synopsis=False, link_origins=None, release_range=(), allowed_years=(), styles=()):
+                    review_text=False, synopsis=False, link_origins=None, release_range=(), allowed_years=(), styles=(),
+                    direct_app=False):
         names = _strings(names)
         keys = {_key(name) for name in names if _key(name)}
         params = {"l": "english", **({"cc": country} if country else {})}
@@ -923,7 +925,7 @@ class _Lookup:
                     continue
                 app = data.get("data") or {}
                 title = app.get("name")
-                if (str(app.get("steam_appid")) != id_ or app.get("type") != "game"
+                if (str(app.get("steam_appid")) != id_ or (not direct_app and app.get("type") != "game")
                         or not isinstance(title, str) or (not linked and _key(title) not in keys)):
                     continue
                 release = app.get("release_date") or {}
@@ -940,6 +942,12 @@ class _Lookup:
                           "languages": re.sub(r"\s+", " ", language_text).strip()[:450],
                           "platforms": [name for name, supported in (app.get("platforms") or {}).items() if supported is True],
                           "match": (link_origins or {}).get(id_, "catalogue") + "_link" if linked else "exact_title", "country": country}
+                if direct_app:
+                    result["app_type"] = _source_excerpt(app.get("type"), 60)
+                    parent = app.get("fullgame")
+                    if isinstance(parent, dict) and re.fullmatch(r"[1-9][0-9]{0,9}", str(parent.get("appid", ""))):
+                        result["base_game"] = {"title": _source_excerpt(parent.get("name"), 150),
+                                               "url": f"{STEAM}/app/{parent['appid']}/"}
                 if any(str(genre.get("description", "")).casefold() == "early access" for genre in _rows(app.get("genres"))):
                     result["early_access"] = True
                 if price.get("final_formatted"):
@@ -1153,37 +1161,44 @@ def _sort_groups(groups: list[list[Entry]], ranking: str):
     return sorted(groups, key=score, reverse=True)
 
 
-def _passes(group, allowed_years, release_range, preferences, exclusions, min_votes, min_minutes, max_minutes,
-            score_source, low, high, *, allow_missing=False):
+def _filter_block(group, allowed_years, release_range, preferences, exclusions, min_votes, min_minutes, max_minutes,
+                  score_source, low, high, *, allow_missing=False):
     if not allow_missing and max(row.votes for row in group) < min_votes:
-        return False
+        return f"可核对的评价人数未达到 {min_votes} 人"
     release_record = _release_record(group)
     released = release_record.released if release_record else ""
     if allowed_years and (released or not allow_missing) and released[:4] not in allowed_years:
-        return False
+        return "首发年份不符" if released else "缺少首发年份"
     if release_range and (released or not allow_missing) and not _fits_release_date(released, *release_range):
-        return False
+        if not released:
+            return "缺少首发日期"
+        return "首发日期精度不足以核对范围" if len(released) < 10 and (
+            _earliest_possible_date(released) < release_range[1] and released >= release_range[0][:len(released)]
+        ) else "首发日期不在指定范围"
     visible_tags = {_key(tag) for row in group for tag in row.tags}
     all_tags = visible_tags | {_key(tag) for row in group for tag in row.hidden_tags}
     if (not allow_missing and all(row.source == "bangumi" for row in group)
             and not visible_tags.intersection(map(_key, VISUAL_NOVEL_TAGS))):
-        return False
-    if not allow_missing and any(not visible_tags.intersection(map(_key, _terms(term))) for term in preferences):
-        return False
-    if exclusions and ((not allow_missing and not any(row.source == "vndb" for row in group))
-                       or any(all_tags.intersection(map(_key, _terms(term))) for term in exclusions)):
-        return False
+        return "缺少视觉小说类型依据"
+    for term in preferences if not allow_missing else ():
+        if not visible_tags.intersection(map(_key, _terms(term))):
+            return f"缺少「{term}」题材标签依据"
+    for term in exclusions:
+        if all_tags.intersection(map(_key, _terms(term))):
+            return f"命中排除标签「{term}」"
+    if exclusions and not allow_missing and not any(row.source == "vndb" for row in group):
+        return "缺少核对排除标签的记录"
     minutes = next((row.minutes for row in group if row.minutes), 0)
     if (minutes or not allow_missing) and ((min_minutes is not None and (not minutes or minutes < min_minutes))
                                           or (max_minutes is not None and (not minutes or minutes > max_minutes))):
-        return False
+        return "已知游玩时长超出所选范围" if minutes else "缺少游玩时长"
     if score_source:
         rating = next((row.rating for row in group if row.source == score_source), None)
         if (rating is not None or not allow_missing) and (
             rating is None or (low is not None and rating < low) or (high is not None and rating > high)
         ):
-            return False
-    return True
+            return "评分不在指定范围" if rating is not None else "缺少指定来源评分"
+    return ""
 
 
 def _candidate_keyword(group):
@@ -1420,14 +1435,24 @@ async def gal_recommend(
         return any((row.source, row.id) in rejected_ids or rejected_ids.intersection(row.bindings.items())
                    or rejected_names.intersection(map(_key, row.names)) for row in group)
 
+    blocked = Counter()
+
     def filtered_groups(*, allow_missing=False):
-        return [group for group in _merge(entries)
-                if not excluded(group)
-                and not (released_only and (release := _release_record(group))
-                         and _earliest_possible_date(release.released) > today.isoformat())
-                and _passes(group, allowed_years, release_range, preferences, exclusions, required_votes,
-                            min_minutes, max_minutes, score_source if discovery else "", low, high,
-                            allow_missing=allow_missing)]
+        kept = []
+        for group in _merge(entries):
+            if excluded(group):
+                reason = "命中排除作品"
+            elif released_only and (release := _release_record(group)) and _earliest_possible_date(release.released) > today.isoformat():
+                reason = "首发日期仍在未来"
+            else:
+                reason = _filter_block(group, allowed_years, release_range, preferences, exclusions, required_votes,
+                                       min_minutes, max_minutes, score_source if discovery else "", low, high,
+                                       allow_missing=allow_missing)
+            if not reason:
+                kept.append(group)
+            elif not allow_missing:
+                blocked[reason] += 1
+        return kept
 
     def recommendation_order(group):
         return (bool(steam_dates and not any(row.source == "vndb" for row in group)),
@@ -1476,8 +1501,12 @@ async def gal_recommend(
                            and any(_bind(row, member) > 0 for group in missing for member in group))
 
     groups = filtered_groups()
+    sample_size = len(groups) + sum(blocked.values())
     if ranking in {"bangumi", "vndb", "erogamescape"}:
-        groups = [group for group in groups if any(row.source == ranking and row.rating is not None for row in group)]
+        ranked = [group for group in groups if any(row.source == ranking and row.rating is not None for row in group)]
+        if len(ranked) < len(groups):
+            blocked["缺少指定榜单的评分"] += len(groups) - len(ranked)
+        groups = ranked
     groups = _sort_groups(groups, ranking)
     if discovery and not names:
         groups.sort(key=recommendation_order)
@@ -1509,9 +1538,21 @@ async def gal_recommend(
             state["matched_rows"] = matched
             if state["status"] == "ok" and not matched:
                 state["status"] = "no_match"
+    def filter_notes(checked=None):
+        if not sample_size:
+            return ["本轮目录未返回可逐项核对的作品，无法判断是哪一个条件限制了结果。"]
+        notes = [f"本轮目录合并后有 {sample_size} 个不同作品候选。"]
+        if checked is not None:
+            notes.append(f"其中 {checked} 部进入发行版本与商店核对。")
+        notes.extend(f"{n} 部{reason}。" for reason, n in blocked.most_common())
+        if unmatched:
+            notes.append("未能唯一对应所问作品名，请用作品链接或原名确认。")
+        return notes
+
     if not groups:
         lookup.sources["steam"]["status"] = "no_candidate"
         return {**result, "reason": "no_eligible_catalogue_matches", "unmatched_titles": unmatched,
+                "filter_notes": filter_notes(),
                 "ambiguous_candidates": ambiguous_candidates}
     needs_edition = bool((languages and not steam_only) or platforms)
     groups = groups[:min(10, wanted_count + (3 if discovery or needs_edition or steam_only else 0))]
@@ -1576,9 +1617,22 @@ async def gal_recommend(
         if task == "release" and store["status"] == "verified_upcoming_listing" and not languages and not country:
             steam_valid = _steam_in_scope(store, steam_dates, steam_years)
         edition = matching_editions.get(vndb_row.id) if vndb_row else None
-        if steam_dates and not steam_valid:
+        if (steam_dates or discovery and steam_only) and not steam_valid:
+            if store["status"] == "verified_upcoming_listing":
+                reason = "所查 Steam 版尚未发售"
+            elif store["status"] != "verified_released_listing":
+                reason = "缺少可核对的 Steam 在售条目"
+            elif not _steam_in_scope(store, steam_dates, steam_years):
+                reason = "Steam 上架日期无法与指定范围匹配"
+            elif languages and not set(languages).intersection(_steam_languages(store)):
+                reason = "Steam 商店未列出所需语言" if store.get("languages") else "缺少 Steam 商店语言记录"
+            else:
+                reason = "缺少该地区的在售价格或免费记录"
+            blocked[reason] += 1
             continue
-        if discovery and (steam_only and not steam_valid or needs_edition and not edition):
+        if discovery and needs_edition and not edition:
+            wanted = " / ".join(part for part in (platform, ("官方" if official_translation else "") + language if language else "") if part)
+            blocked[f"缺少符合{wanted or '所选条件'}的发行版本记录"] += 1
             continue
         display = next((row.display for row in group if row.source == "ymgal" and row.display), "")
         display = display or next((row.display for row in group if row.display), group[0].title)
@@ -1587,10 +1641,12 @@ async def gal_recommend(
         release_source = release.source if release else None
         if check_versions and vndb_row and release_source == "vndb" and _is_partial_version_date(
                 steam_releases, vndb_row.id, released, store):
+            blocked["仅查到部分版本日期，无法核实完整作品首发"] += 1
             continue
         if earlier := _earlier_steam_release(store, released, today):
             if ((allowed_years and earlier[:4] not in allowed_years)
                     or (release_range and not _fits_release_date(earlier, *release_range))):
+                blocked["另有更早的发行记录，首发日期不符"] += 1
                 continue
             released, release_source = earlier, "steam"
         release_disagreements = [{"source": row.source, "date": row.released, "url": row.url} for row in group
@@ -1645,6 +1701,7 @@ async def gal_recommend(
         else:
             reason = "no_eligible_catalogue_matches"
         return {**result, "reason": reason, "unmatched_titles": unmatched,
+                "filter_notes": filter_notes(len(checked)),
                 "ambiguous_candidates": ambiguous_candidates}
     if discovery and not names:
         eligible_items.sort(key=lambda item: (_style_order(item["style_unverified"]), bool(item["missing_fields"])))

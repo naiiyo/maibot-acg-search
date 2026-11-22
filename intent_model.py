@@ -130,7 +130,8 @@ def _overlay(query: str, baseline: SearchIntent, intent: _ModelIntent) -> Search
 async def recognize_intent(ctx, query: str, baseline: SearchIntent, *, today: date,
                            model_name: str, timeout: float) -> SearchIntent:
     model_name = model_name.strip()
-    if not model_name or baseline.reason in _PROTECTED or baseline.medium == "bangumi":
+    if (not model_name or baseline.reason in _PROTECTED or baseline.medium == "bangumi"
+            or baseline.reason in {"work_link", "series_order", "missing_series_title"}):
         return baseline
     request = json.dumps({
         "date": today.isoformat(), "query": query,

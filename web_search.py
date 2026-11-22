@@ -56,6 +56,8 @@ class _PublicPage(HTMLParser):
         self.ignored = []
 
     def handle_starttag(self, tag, attrs):
+        if tag in {"p", "div", "li", "tr", "article", "section", "h1", "h2", "h3", "br"} and not self.ignored:
+            self.parts.append("\n")
         if tag == "title":
             self.in_title = True
         elif tag in {"script", "style", "template", "svg"}:
@@ -66,6 +68,8 @@ class _PublicPage(HTMLParser):
                 self.parts.append(_text(meta.get("content"), 600))
 
     def handle_endtag(self, tag):
+        if tag in {"p", "div", "li", "tr", "article", "section", "h1", "h2", "h3"} and not self.ignored:
+            self.parts.append("\n")
         if tag == "title":
             self.in_title = False
         elif self.ignored and self.ignored[-1] == tag:
@@ -94,7 +98,9 @@ async def fetch_public_broadcast(client, url: str, *, timeout: float) -> dict | 
                     break
             page = _PublicPage()
             page.feed(data.decode(response.encoding or "utf-8", errors="replace"))
-            return {"url": url, "title": _text(" ".join(page.title), 180), "content": _text(" ".join(page.parts), 12000)}
+            lines = (" ".join(line.split()) for line in " ".join(page.parts).splitlines())
+            return {"url": url, "title": _text(" ".join(page.title), 180),
+                    "content": "\n".join(line for line in lines if line)[:12000]}
     except (TimeoutError, httpx.HTTPError, ValueError, LookupError):
         return None
 

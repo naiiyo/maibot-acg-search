@@ -12,10 +12,12 @@ from urllib.parse import quote, urlsplit, urlunsplit
 
 import httpx
 
+from .broadcast import episode_statement, explicit_seasons, requested_publishers
+from .series import chapter_mapping, series_guide, wants_chapter_mapping
 from .web_search import valid_source_url
 
 
-# Official contract: https://github.com/bangumi/api/blob/master/open-api/v0.yaml
+# Official contract: https://github.com/bangumi/server/blob/master/openapi/v0.yaml
 _API = 'https://api.bgm.tv'
 _TYPE = {'anime': 2, 'manga': 1, 'acg_game': 4}
 _DIRECT_DOMAINS = {1: 'book', 2: 'anime', 3: 'music', 4: 'acg_game', 6: 'real'}
@@ -30,11 +32,7 @@ _SUBJECT_LINK = re.compile(r'https?://(?:www\.)?(?:bgm\.tv|bangumi\.tv|chii\.in)
 _RELATED = {'staff': ('persons', 'people'), 'characters': ('characters', 'characters'), 'relations': ('subjects', 'relations')}
 _COLLECTION_TYPES = ('wish', 'collect', 'doing', 'on_hold', 'dropped')
 _MAX_RESPONSE = 2_000_000
-_USER_AGENT = 'naiiyo/maibot-acg-search/0.1.2 (https://github.com/naiiyo/maibot-acg-search)'
-_EPISODE_MARKER = re.compile(
-    r'更新至第?\s*\d+\s*[集话話]|第\s*\d+\s*[集话話]|\b(?:episode|ep\.?)[ #]*\d+\b'
-    r'|(?<!\w)[#＃]\s*\d{1,4}\b|(?<![\w全共])\d{1,4}\s*[集话話]', re.I,
-)
+_USER_AGENT = 'naiiyo/maibot-acg-search/0.1.3 (https://github.com/naiiyo/maibot-acg-search)'
 _MONTHS = {'冬': 1, '春': 4, '夏': 7, '秋': 10}
 _PLATFORMS = {
     'abema.tv': ('ABEMA', ('/video/', '/channels/')),
@@ -63,10 +61,10 @@ def _text(value, limit=160):
     return ' '.join(value.split())[:limit] if isinstance(value, str) else ''
 
 
-def _terms(values, limit):
+def _terms(values, limit, *, text_limit=80):
     if not isinstance(values, (tuple, list)):
         return []
-    return list(dict.fromkeys(term for value in values if (term := _text(value, 80))))[:limit]
+    return list(dict.fromkeys(term for value in values if (term := _text(value, text_limit))))[:limit]
 
 
 def _key(value):
@@ -195,7 +193,12 @@ def _official_site(row):
     return None
 
 
-def _subject(row, domain, window, exclusions, category_filtered, preferences=()):
+def _filtered(trace, reason, identifier):
+    if trace is not None:
+        trace.setdefault(reason, set()).add(identifier)
+
+
+def _subject(row, domain, window, exclusions, category_filtered, preferences=(), trace=None):
     identifier = row.get('id')
     kind = row.get('type')
     if (type(identifier) is not int or identifier < 1 or type(kind) is not int or row.get('nsfw') is True
@@ -208,6 +211,7 @@ def _subject(row, domain, window, exclusions, category_filtered, preferences=())
         return None
     released = _parse_date(row.get('date'))
     if window and (released is None or not window[0] <= released < window[1]):
+        _filtered(trace, '没有可核实的条目日期' if released is None else '条目日期在指定时段之外', identifier)
         return None
     tags = row.get('tags')
     tags = [item.get('name') for item in tags if isinstance(item, dict)] if isinstance(tags, list) else []
@@ -216,19 +220,24 @@ def _subject(row, domain, window, exclusions, category_filtered, preferences=())
     platform = _text(row.get('platform'), 70)
     tag_keys = {_key(tag) for tag in [platform, *tags]}
     if any(_key(tag) not in tag_keys for tag in preferences):
+        _filtered(trace, '返回标签无法证实全部指定题材（' + '、'.join(preferences) + '）', identifier)
         return None
     if domain == 'manga':
         category = row.get('category')
         if (category is not None and category != 1001
                 or not (category_filtered or category == 1001 or tag_keys & {'漫画', 'マンガ'})):
+            _filtered(trace, '目录分类未匹配漫画', identifier)
             return None
     if any(_key(term) in tag_keys or any(_key(term) in _key(name) for name in titles) for term in exclusions if _key(term)):
+        _filtered(trace, '标题或标签命中了排除条件', identifier)
         return None
     rating = row['rating'] if isinstance(row.get('rating'), dict) else {}
     collection = row['collection'] if isinstance(row.get('collection'), dict) else {}
     counts = {kind: collection[kind] for kind in _COLLECTION_TYPES if type(collection.get(kind)) is int
               and 0 <= collection[kind] <= 100_000_000}
     heat = _number(row.get('collection_total'), 100_000_000)
+    if type(row.get('collection_total')) is int and row['collection_total'] == 0:
+        heat = 0
     if heat is None and counts:
         heat = sum(counts.values())
     acg_tags = [tag for tag in tags if _key(tag) in _ACG_TAGS]
@@ -295,7 +304,7 @@ async def resolve_bangumi_title(client, title, *, token='') -> tuple[str, str] |
     return None
 
 
-async def _browse_subjects(client, headers, domain, window, preferences, exclusions, sort, limit, diagnostics, *, series=False):
+async def _browse_subjects(client, headers, domain, window, preferences, exclusions, sort, limit, diagnostics, *, series=False, trace=None):
     params = {'type': _TYPE[domain], 'limit': limit, 'sort': 'date' if sort == 'date' else 'rank'}
     if domain == 'manga':
         params['cat'] = 1001
@@ -329,7 +338,7 @@ async def _browse_subjects(client, headers, domain, window, preferences, exclusi
     if len(failures) == len(pages):
         raise failures[0]
     return [subject for row in rows
-            if (subject := _subject(row, domain, window, exclusions, domain == 'manga', preferences))]
+            if (subject := _subject(row, domain, window, exclusions, domain == 'manga', preferences, trace))]
 
 
 async def _legacy_subjects(client, headers, domain, keyword, window, exclusions, diagnostics):
@@ -359,7 +368,7 @@ async def _legacy_subjects(client, headers, domain, keyword, window, exclusions,
 
 
 async def _subjects(client, headers, domain, keyword, window, preferences, exclusions, sort, limit, diagnostics, *,
-                    series=False, search_terms=(), search_tags=()):
+                    series=False, search_terms=(), search_tags=(), trace=None):
     if identifier := _SUBJECT_LINK.fullmatch(keyword):
         detail = await _request(client, 'GET', f'/v0/subjects/{identifier[1]}', headers, diagnostics, 'subject_detail')
         match = _subject(detail, domain, window, exclusions, False) if detail.get('id') == int(identifier[1]) else None
@@ -373,7 +382,7 @@ async def _subjects(client, headers, domain, keyword, window, preferences, exclu
     if browse:
         try:
             rows = await _browse_subjects(client, headers, domain, window, preferences, exclusions, sort, limit,
-                                          diagnostics, series=series)
+                                          diagnostics, series=series, trace=trace)
             if rows:
                 return rows, 'browse'
         except (httpx.HTTPError, TimeoutError, ValueError) as error:
@@ -394,7 +403,7 @@ async def _subjects(client, headers, domain, keyword, window, preferences, exclu
                                   json={'keyword': term, 'filter': query_filters,
                                         'sort': 'match' if term or sort == 'date' else sort})
         return [subject for row in _rows(response)[:limit]
-                if (subject := _subject(row, domain, window, exclusions, False, preferences))]
+                if (subject := _subject(row, domain, window, exclusions, False, preferences, trace))]
 
     def has_match(rows):
         return any(_exact_match(row, keyword) if keyword else domain != 'acg_game' or row['acg_tag_evidence'] for row in rows)
@@ -433,7 +442,7 @@ async def _subjects(client, headers, domain, keyword, window, preferences, exclu
                 method = 'legacy_search'
             else:
                 recovered = await _browse_subjects(client, headers, domain, window, preferences, exclusions, sort, limit,
-                                                   diagnostics, series=series)
+                                                   diagnostics, series=series, trace=trace)
                 method = 'browse'
             return (recovered, method) if recovered or primary_error is not None else (rows, 'search')
     except (httpx.HTTPError, TimeoutError, ValueError) as error:
@@ -523,8 +532,9 @@ def _broadcaster(url):
         return ''
     parsed = urlsplit(url)
     host = parsed.hostname
+    path = re.sub(r'^/(?:[a-z]{2}(?:-[a-zA-Z]{2})?)(?=/)', '', parsed.path)
     return next((label for domain, (label, paths) in _PLATFORMS.items()
-                 if (host == domain or host.endswith('.' + domain)) and parsed.path.startswith(paths)), '')
+                 if (host == domain or host.endswith('.' + domain)) and path.startswith(paths)), '')
 
 
 def _broadcast_ref(row, titles):
@@ -545,7 +555,7 @@ def _broadcast_ref(row, titles):
             'matched_titles': matched_titles, 'published_at': _text(row.get('published_at'), 40) or None}
 
 
-async def _fetch_broadcast_page(fetch_web, fetch_direct, reference, titles):
+async def _fetch_broadcast_page(fetch_web, fetch_direct, reference, titles, region, seasons):
     source = urlsplit(reference['url'])
     if source.scheme != 'https' or source.netloc != source.hostname:
         return None, {'url': reference['url'], 'status': 'unsafe_url'}
@@ -559,33 +569,39 @@ async def _fetch_broadcast_page(fetch_web, fetch_direct, reference, titles):
         except Exception:
             attempts[backend] = 'unavailable'
             continue
-        if evidence := _broadcast_page_evidence(page, reference, titles, url):
+        if evidence := _broadcast_page_evidence(page, reference, titles, url, region, seasons):
             attempts[backend] = 'ok'
             return {**evidence, 'fetch_source': backend}, attempts
         attempts[backend] = 'no_usable_evidence' if isinstance(page, dict) else 'unavailable'
     return None, attempts
 
 
-def _broadcast_page_evidence(page, reference, titles, url):
+def _broadcast_page_evidence(page, reference, titles, url, region='', seasons=()):
     if not isinstance(page, dict):
         return None
     resolved = page.get('url') or url
     if _broadcaster(resolved) != reference['publisher']:
         return None
     title = _text(page.get('title'), 180)
-    content = _text(page.get('content'), 12_000)
-    if not content or not any(len(_key(name)) >= 2 and _key(name) in _key(title + ' ' + content) for name in titles):
+    content = page.get('content')
+    if not isinstance(content, str) or not content.strip():
         return None
-    material = title + ' ' + content
-    marker = _EPISODE_MARKER.search(material)
-    if not marker:
-        return None
-    excerpt = material[max(0, marker.start() - 80):marker.end() + 145].strip()
-    return {'url': resolved, 'title': title or reference['title'], 'publisher': reference['publisher'],
-            'episode_excerpt': excerpt, 'retrieved_at': _text(page.get('retrieved_at'), 50) or None}
+    dedicated = urlsplit(resolved).path.startswith(('/bangumi/play/', '/bangumi/media/', '/video/episode/', '/watch/'))
+    evidence = episode_statement(title, content, titles, region, seasons, dedicated)
+    if evidence:
+        path = urlsplit(resolved).path
+        series_page = bool(re.search(r'/(?:bangumi/(?:play/ss\d+|media/md\d+)|(?:video/)?title/|series/|a_)', path))
+        if evidence['explicit_latest']:
+            evidence['latest_scope'] = 'series_page' if series_page else 'as_stated_on_this_page'
+            if not series_page:
+                evidence['evidence_label'] += '（以该页面发布时为准）'
+        return {**evidence, 'url': resolved, 'title': title or reference['title'], 'publisher': reference['publisher'],
+                'retrieved_at': _text(page.get('retrieved_at'), 50) or datetime.now(timezone.utc).isoformat(timespec='seconds')}
+    return None
 
 
-async def _broadcast(search_web, fetch_web, fetch_direct, query, titles, alternate_titles, region, task, broadcast_query):
+async def _broadcast(search_web, fetch_web, fetch_direct, query, titles, alternate_titles, region, task, broadcast_query,
+                     deadline=None):
     # Search is independent of Bangumi. Provider snippets are evidence to
     # inspect, not a confirmation of an episode, timezone or regional rights.
     names = ' OR '.join('"' + name.replace('"', '') + '"' for name in titles[:3])
@@ -610,19 +626,40 @@ async def _broadcast(search_web, fetch_web, fetch_direct, query, titles, alterna
         return {**base, 'status': 'error'}
     references = [item for row in rows[:15]
                   if isinstance(row, dict) and (item := _broadcast_ref(row, alternate_titles))]
+    wanted = requested_publishers(query, (label for label, _ in _PLATFORMS.values()))
+    if wanted:
+        references = [row for row in references if row['publisher'] in wanted and row['source_kind'] == 'known_broadcaster']
     references = sorted({row['url']: row for row in references}.values(),
                         key=lambda row: row['source_kind'] != 'known_broadcaster')[:6]
     official = [row for row in references if row['source_kind'] == 'known_broadcaster']
     pages, attempts = [], []
     if (fetch_web or fetch_direct) and official and task in _BROADCAST:
-        fetched = await asyncio.gather(*(_fetch_broadcast_page(fetch_web, fetch_direct, row, alternate_titles)
-                                         for row in official[:2]))
-        pages = [row for row, _ in fetched if row]
-        attempts = [attempt for _, attempt in fetched]
+        seasons = explicit_seasons(query, titles)
+        reads = [asyncio.create_task(_fetch_broadcast_page(fetch_web, fetch_direct, row, alternate_titles, region, seasons))
+                 for row in official[:2]]
+        remaining = 12 if deadline is None else max(0, deadline - asyncio.get_running_loop().time() - 0.1)
+        try:
+            done, _ = await asyncio.wait(reads, timeout=remaining)
+        finally:
+            for read in reads:
+                if not read.done():
+                    read.cancel()
+            await asyncio.gather(*reads, return_exceptions=True)
+        for ref, read in zip(official, reads):
+            if read not in done or read.cancelled():
+                attempts.append({'url': ref['url'], 'status': 'timeout'})
+            elif read.exception() is not None:
+                attempts.append({'url': ref['url'], 'status': 'unavailable'})
+            else:
+                page, attempt = read.result()
+                attempts.append(attempt)
+                if page:
+                    pages.append(page)
     return {**base, 'status': 'broadcaster_references' if official else 'unverified_references' if references else 'empty',
             'references': references, 'official_page_evidence': pages, 'fetch_attempts': attempts,
             'provider': _text(result.get('provider'), 80),
-            'notice': ('官方页面摘录需要结合平台地区、季数和发布时间判断，目录日期仅作对照。' if pages else base['notice'])}
+            'notice': ('仅按每条官网摘录标出的状态、季数及地区回答。预告和单集条目不能证明当前最新一集。只有系列页明确标注更新至的集数可作该平台当前进度；旧公告以发布时为准。'
+                       if pages else base['notice'])}
 
 
 async def recommend_bangumi(client, query, *, domain, task, entities=(), year=None, month=None, season=None,
@@ -677,7 +714,7 @@ async def recommend_bangumi(client, query, *, domain, task, entities=(), year=No
     errors = 0
     diagnostics, methods = set(), set()
     unmatched, ambiguous, matches_by_title = [], [], {}
-    selected = []
+    selected, filter_notes, filtered_ids = [], [], {}
     if keywords:
         limit = min(max(count * 6, 15), 40) if discovery else 12
         responses = await asyncio.gather(*(_subjects(
@@ -685,6 +722,7 @@ async def recommend_bangumi(client, query, *, domain, task, entities=(), year=No
             _terms(preferences, 6) if discovery else [], _terms(exclusions, 6), sort, limit, diagnostics,
             series=domain == 'manga' and discovery and not _VOLUME_REQUEST.search(query),
             search_terms=search_terms if len(keywords) == 1 else (), search_tags=search_tags,
+            trace=filtered_ids if discovery else None,
         ) for keyword in keywords), return_exceptions=True)
         for keyword, response in zip(keywords, responses):
             if isinstance(response, Exception):
@@ -697,32 +735,60 @@ async def recommend_bangumi(client, query, *, domain, task, entities=(), year=No
             rows, method = response
             methods.add(method)
             if keyword:
-                matches = rows if method == 'subject_detail' else [row for row in rows if _exact_match(row, keyword)]
+                matches = list({row['id']: row for row in rows if method == 'subject_detail' or _exact_match(row, keyword)}.values())
                 if len(matches) > 1:
                     ambiguous.append(keyword)
+                    filter_notes.append(f'“{keyword}”在本次结果中对应 {len(matches)} 个同名条目，需要辨认版本。')
                 elif not matches:
                     unmatched.append(keyword)
+                    others = len({row['id'] for row in rows})
+                    filter_notes.append(f'“{keyword}”没有匹配到确切作品' + (f'，本次返回的 {others} 个近似条目未计入。' if others else '。'))
+                    if 'series_order' in fields and len(_key(keyword)) >= 2:
+                        branches = {row['id']: {key: row[key] for key in ('id', 'title', 'url')} for row in rows if any(
+                            _key(keyword) in _key(name) for name in (row['title'], row['original_title'], *row['aliases'])
+                        )}
+                        if branches:
+                            candidates = list(branches.values())[:4]
+                            output.setdefault('series_candidates', {})[keyword] = candidates
+                            filter_notes.append('可请用户指定一个目录条目作为起点：' + '、'.join(row['title'] for row in candidates) + '。')
                 matches_by_title[keyword] = [row['id'] for row in matches[:3]]
                 selected.extend(matches[:3])
             else:
-                selected.extend(row for row in rows if domain != 'acg_game' or row['acg_tag_evidence'])
-    if discovery and domain == 'manga' and not _VOLUME_REQUEST.search(query):
-        selected = [row for row in selected if not any(_VOLUME_SUFFIX.search(name)
-                                                     for name in (row['title'], row['original_title']))]
-    if discovery and domain == 'acg_game' and not any(platform in query for platform in _TABLETOP_PLATFORMS):
-        selected = [row for row in selected if row['platform'] not in _TABLETOP_PLATFORMS]
-    blocked = _terms(excluded_titles, 8)
-    records = list({row['id']: row for row in selected
-                    if not any(_exact_match(row, name) for name in blocked)}.values())
+                selected.extend(rows)
+    blocked = _terms(excluded_titles, len(excluded_titles), text_limit=160) if isinstance(excluded_titles, (tuple, list)) else []
+    records = []
+    for row in {item['id']: item for item in selected}.values():
+        if discovery and domain == 'acg_game' and not row['acg_tag_evidence']:
+            reason = '缺少可核对的二次元游戏标签'
+        elif discovery and domain == 'manga' and not _VOLUME_REQUEST.search(query) and any(
+            _VOLUME_SUFFIX.search(name) for name in (row['title'], row['original_title'])
+        ):
+            reason = '仅对应漫画单卷'
+        elif discovery and domain == 'acg_game' and row['platform'] in _TABLETOP_PLATFORMS and not any(
+            platform in query for platform in _TABLETOP_PLATFORMS
+        ):
+            reason = '属于桌游'
+        elif any(_exact_match(row, name) for name in blocked):
+            reason = '命中了用户排除的作品'
+        elif discovery and sort == 'heat' and row['heat'] is None:
+            reason = '没有可用于热度排序的收藏数据'
+        else:
+            records.append(row)
+            continue
+        _filtered(filtered_ids, reason, row['id'])
     if discovery:
-        if sort == 'heat':
-            records = [row for row in records if row['heat'] is not None]
         output['catalogue_candidate_count'] = len(records)
         if sort == 'rank':
             records.sort(key=lambda row: (row['rank'] or math.inf, -(row['votes'] or 0), -(row['heat'] or 0)))
         else:
             records.sort(key=lambda row: row[sort] or ('' if sort == 'date' else 0), reverse=True)
         records = records[:count]
+    if not records or ambiguous or unmatched:
+        filter_notes.extend(f'本次目录样本中有 {len(ids)} 个条目{reason}。' for reason, ids in filtered_ids.items())
+        if not filter_notes and methods and discovery:
+            filter_notes.append('目录在本次查询条件下没有返回候选，无法判断单独放宽哪个条件能得到结果。')
+        if filter_notes:
+            output['filter_notes'] = filter_notes[:12]
     output.update(results=records, unmatched_entities=unmatched, ambiguous_entities=ambiguous,
                   matches_by_title=matches_by_title, catalogue_methods=sorted(methods))
     if errors:
@@ -739,15 +805,28 @@ async def recommend_bangumi(client, query, *, domain, task, entities=(), year=No
         names = _terms([row['title'] for row in records] + [name for name in titles if not _SUBJECT_LINK.fullmatch(name)], 3)
         aliases = _terms(names + [name for row in records[:3] for name in (row['original_title'], *row['aliases'])], 12)
         jobs[(None, 'official_broadcast')] = _broadcast(search_web, fetch_web, fetch_direct, query, names, aliases,
-                                                        region, task, broadcast_query)
+                                                        region, task, broadcast_query, deadline)
         episode_targets = records[:3] if task in _BROADCAST and not discovery and not ambiguous else []
         for row in episode_targets:
             jobs[(row['id'], 'episode_evidence')] = _episodes(client, headers, row['id'], today, diagnostics)
     if records and not discovery and not ambiguous:
         for field, (kind, key) in _RELATED.items():
-            if field in fields:
+            if field in fields and not (field == 'relations' and 'series_order' in fields):
                 for row in records[:2]:
                     jobs[(row['id'], key)] = _related_records(client, headers, row['id'], kind, diagnostics)
+        if 'series_order' in fields:
+            async def read_relations(identifier):
+                return await _request(client, 'GET', f'/v0/subjects/{identifier}/subjects', headers, diagnostics,
+                                      'subjects', expect_list=True)
+
+            now = asyncio.get_running_loop().time()
+            series_deadline = min(now + 9, deadline - 0.05) if deadline is not None else now + 9
+            for row in records[:2]:
+                kind = _TYPE.get(row['subject_domain'], 1 if row['subject_domain'] == 'book' else None)
+                if kind:
+                    jobs[(row['id'], 'series_guide')] = series_guide(row, kind, read_relations, series_deadline)
+                    if wants_chapter_mapping(query):
+                        jobs[(row['id'], 'chapter_mapping')] = chapter_mapping(query, row, search_web, fetch_web)
     enrichment_timed_out = False
     if jobs:
         by_id = {row['id']: row for row in records}
@@ -771,6 +850,11 @@ async def recommend_bangumi(client, query, *, domain, task, entities=(), year=No
                 output[key] = result if isinstance(result, dict) else {'status': 'error', 'references': []}
             elif key == 'episode_evidence':
                 by_id[identifier][key] = result if isinstance(result, dict) else {'status': 'unavailable'}
+            elif key == 'series_guide':
+                by_id[identifier][key] = result if isinstance(result, dict) else {'coverage': 'partial'}
+            elif key == 'chapter_mapping':
+                guide = by_id[identifier].setdefault('series_guide', {})
+                guide[key] = result if isinstance(result, dict) else {'status': 'unconfirmed', 'notice': '尚缺出版社明确说明的章节对应。'}
             elif isinstance(result, list):
                 by_id[identifier][key] = result
     if diagnostics:
